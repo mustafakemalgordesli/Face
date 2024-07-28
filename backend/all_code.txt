@@ -1,0 +1,467 @@
+--- Start of models/user.py ---
+from db import Base
+from sqlalchemy import Column, Integer, String, ForeignKey, LargeBinary, DateTime
+from sqlalchemy.orm import relationship
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, nullable=False)
+    fullname = Column(String, nullable=True)
+    password = Column(String, nullable=False)
+    imageurl = Column(String, nullable=True)
+    vector = Column(LargeBinary, nullable=True)
+
+    granted_permissions = relationship("Permission", foreign_keys="Permission.user_id", back_populates="user")
+
+class Permission(Base):
+    __tablename__ = "permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    assigned_by_id = Column(Integer, ForeignKey("residents.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))
+    apartment_id = Column(Integer, ForeignKey("apartments.id"))
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime, nullable=False)
+
+    assigned_by = relationship("Resident", back_populates="created_permissions")
+    user = relationship("User", back_populates="granted_permissions")
+    apartment = relationship("Apartment")
+
+--- End of {file_path} ---
+
+--- Start of routes/user.py ---
+# routes/user.py
+
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+import bcrypt
+from datetime import datetime, timedelta
+import jwt
+import os
+import uuid
+from typing import Optional
+from preprocess import Preprocess
+import cv2
+import pickle
+import numpy as np
+
+from db import get_db
+from models.user import User
+from verify_token import verify_jwt_token
+from models.user import Permission
+
+
+prep = Preprocess()
+
+user_router = APIRouter()
+
+class UserCreate(BaseModel):
+    fullname: str
+    email: EmailStr
+    password: str
+    
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    fullname: Optional[str] = None
+    email: EmailStr
+    imageurl: Optional[str] = None
+
+    class Config:
+        from_attributes = True 
+
+class AuthResponse(BaseModel):
+    user: UserResponse
+    token: str
+
+class PermissionCreate(BaseModel):
+    user_id: int
+    apartment_id: int
+    start_date: datetime
+    end_date: datetime
+
+class PermissionResponse(BaseModel):
+    id: int
+    assigned_by_id: int
+    user_id: int
+    apartment_id: int
+    start_date: datetime
+    end_date: datetime
+
+    class Config:
+        from_attributes = True
+
+class PermissionAssign(BaseModel):
+    permission_id: int
+    user_id: int
+
+def create_jwt_token(user_id: int, username: str) -> str:
+    secret_key = os.getenv("SECRET_KEY")
+    if not secret_key:
+        raise ValueError("SECRET_KEY environment variable is not set")
+    
+    payload = {
+        'id': user_id,
+        'email': username,
+        'exp': datetime.utcnow() + timedelta(weeks=4)
+    }
+    jwt_token = jwt.encode(payload, secret_key, algorithm='HS256')
+    return jwt_token
+
+@user_router.post("/user/register", response_model=AuthResponse)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    try:
+        if db.query(User).filter(User.email == user.email).first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        db_user = User(email=user.email, fullname=user.fullname, password=hashed_password)
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        jwt_token = create_jwt_token(db_user.id, db_user.email)
+        return AuthResponse(token=jwt_token, user=UserResponse(id=db_user.id, fullname=db_user.fullname, email=db_user.email))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@user_router.post("/user/login", response_model=AuthResponse)
+def login_user(user: UserLogin, db: Session = Depends(get_db)):
+    try:
+        db_user = db.query(User).filter(User.email == user.email).first()
+        if db_user is None:
+            raise HTTPException(status_code=400, detail="Invalid credentials")
+
+        if not bcrypt.checkpw(user.password.encode('utf-8'), db_user.password.encode('utf-8')):
+            raise HTTPException(status_code=400, detail="Invalid credentials")
+
+        jwt_token = create_jwt_token(db_user.id, db_user.email)
+        return AuthResponse(token=jwt_token, user=UserResponse(id=db_user.id, fullname=db_user.fullname, email=db_user.email))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@user_router.post("/user/photo", response_model=UserResponse)
+async def update_profile_photo(request: Request, image: UploadFile = File(...), db: Session = Depends(get_db)):
+    try:
+        decoded_token = verify_jwt_token(request.headers.get("authorization"))
+        if decoded_token == None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        db_user = db.query(User).filter(User.id == decoded_token["id"]).first()
+        
+        file_extension = os.path.splitext(image.filename)[-1]  # Extract the file extension
+        filename = str(uuid.uuid4()) +file_extension
+        
+        filepath = os.path.join("static", filename)
+        
+        with open(filepath, "wb") as f:
+            contents = await image.read()
+            f.write(contents)
+            
+        face, coor = prep.getFace(cv2.imread(filepath))
+        
+        if face != None:
+            (x1, y1, x2, y2) =coor[0]
+            img = cv2.imread(filepath)
+            cropped_image = img[y1:y2, x1:x2]
+            data_serialized = pickle.dumps(prep.embedding(cropped_image))
+            db_user.vector = data_serialized            
+            crop_name = f"cropped_{filename}.jpg"
+            cv2.imwrite(f'./static/{crop_name}', cropped_image)
+
+
+        url = f"/static/{filename}"
+        db_user.imageurl = url
+        db.commit()
+        return db_user
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@user_router.post("/user/photo/test")
+async def update_profile_photo_test(request: Request, image: UploadFile = File(...), db: Session = Depends(get_db)):
+    try:
+        decoded_token = verify_jwt_token(request.headers.get("authorization"))
+        if decoded_token is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        db_user = db.query(User).filter(User.id == decoded_token["id"]).first()
+        if db_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        contents = await image.read()
+        np_array = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+        
+        face, coor = prep.getFace(image)
+                
+        if face is None:
+            raise HTTPException(status_code=400, detail="Face not found")
+        
+        (x1, y1, x2, y2) = coor[0]
+        cropped_image = image[y1:y2, x1:x2]
+        vector = prep.embedding(cropped_image)
+        if db_user.vector is None:
+            raise HTTPException(status_code=400, detail="User vector not found")
+        
+        sim = prep.euclid_distance(pickle.loads(db_user.vector), vector)
+        if 0 < sim < 1:
+            return {"issuccess": True}
+        return {"issuccess": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@user_router.post("/user/permission/create", response_model=PermissionResponse)
+def create_permission(permission: PermissionCreate, db: Session = Depends(get_db)):
+    try:
+        assigned_by_id = 1  # This should be dynamically determined based on the logged-in resident
+        new_permission = Permission(
+            assigned_by_id=assigned_by_id,
+            user_id=permission.user_id,
+            apartment_id=permission.apartment_id,
+            start_date=permission.start_date,
+            end_date=permission.end_date
+        )
+        db.add(new_permission)
+        db.commit()
+        db.refresh(new_permission)
+        return new_permission
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@user_router.post("/user/permission/assign", response_model=PermissionResponse)
+def assign_permission(permission: PermissionAssign, db: Session = Depends(get_db)):
+    try:
+        permission_entry = db.query(Permission).filter(Permission.id == permission.permission_id).first()
+        if not permission_entry:
+            raise HTTPException(status_code=404, detail="Permission not found")
+        permission_entry.user_id = permission.user_id
+        db.commit()
+        db.refresh(permission_entry)
+        return permission_entry
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+--- End of {file_path} ---
+
+--- Start of db.py ---
+# db.py
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+
+DATABASE_URL = "sqlite:///./complex_management.db"
+
+# Create a new SQLAlchemy engine
+engine = create_engine(DATABASE_URL)
+
+# Create a new sessionmaker
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Create a base class for our models
+Base = declarative_base()
+
+# Dependency to get the session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+--- End of {file_path} ---
+
+--- Start of main.py ---
+# main.py
+# uvicorn main:app --reload   
+import os
+import uuid
+from datetime import datetime
+from fastapi import FastAPI, Depends, File, UploadFile, Form, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, MetaData
+from sqlalchemy.orm import relationship, Session
+from typing import List, Optional
+from db import Base, engine, get_db
+from fastapi.middleware.cors import CORSMiddleware
+from routes.user import user_router
+from dotenv import load_dotenv
+from fastapi.staticfiles import StaticFiles  # StaticFiles import edildi
+# In main.py
+from models.user import Permission
+
+
+load_dotenv()
+
+metadata = MetaData()
+
+# Define the Apartments model
+class Apartment(Base):
+    __tablename__ = "apartments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    number = Column(String, unique=True, nullable=False)
+    floor = Column(Integer)
+
+# Define the Residents model
+class Resident(Base):
+    __tablename__ = "residents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    apartment_id = Column(Integer, ForeignKey("apartments.id"))
+    url = Column(String, nullable=True)  # Nullable url field
+
+    apartment = relationship("Apartment", back_populates="residents")
+    created_permissions = relationship("Permission", back_populates="assigned_by")
+
+Apartment.residents = relationship("Resident", back_populates="apartment")
+
+# Define the Users model
+users_table = Table(
+    'users', metadata,
+    Column('id', Integer, primary_key=True, index=True),
+    Column('fullname', String, nullable=False),
+    Column('email', String, unique=True, nullable=False),
+    Column('password', String, nullable=False),
+    Column('imageurl', String, nullable=True),
+    Column('vector', String, nullable=True),
+    extend_existing=True  # Bu satırı ekleyin
+)
+
+# Create the tables in the database
+Base.metadata.create_all(bind=engine)
+
+# Define the Pydantic models
+class ApartmentCreateItem(BaseModel):
+    number: str
+    floor: int
+
+class ApartmentCreate(BaseModel):
+    apartments: List[ApartmentCreateItem]
+
+class ResidentCreateItem(BaseModel):
+    name: str
+    apartment_id: int
+    url: Optional[str]  # Make url field optional
+
+class ResidentCreate(BaseModel):
+    residents: List[ResidentCreateItem]
+
+class ResidentResponse(BaseModel):
+    id: int
+    name: str
+    apartment_id: int
+    url: Optional[str]  # Make url field optional
+
+    class Config:
+        from_attributes = True
+
+class ApartmentResponse(BaseModel):
+    id: int
+    number: str
+    floor: int
+    residents: List[ResidentResponse] = []
+
+    class Config:
+        from_attributes = True
+
+class PermissionCreate(BaseModel):
+    user_id: int
+    apartment_id: int
+    start_date: datetime
+    end_date: datetime
+
+class PermissionResponse(BaseModel):
+    id: int
+    assigned_by_id: int
+    user_id: int
+    apartment_id: int
+    start_date: datetime
+    end_date: datetime
+
+    class Config:
+        from_attributes = True
+
+# Create a FastAPI instance
+app = FastAPI()
+
+app.include_router(user_router)
+
+# Statik dosyalara hizmet vermek için StaticFiles middleware'i ekle
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+origins = ["*"]
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Endpoint to add multiple apartments
+@app.post("/apartments/", response_model=List[ApartmentResponse])
+def create_apartments(apartments: ApartmentCreate, db: Session = Depends(get_db)):
+    created_apartments = []
+    for apartment in apartments.apartments:
+        existing_apartment = db.query(Apartment).filter(Apartment.number == apartment.number).first()
+        if existing_apartment:
+            raise HTTPException(status_code=400, detail=f"Apartment with number {apartment.number} already exists")
+        
+        db_apartment = Apartment(number=apartment.number, floor=apartment.floor)
+        db.add(db_apartment)
+        db.commit()
+        db.refresh(db_apartment)
+        created_apartments.append(db_apartment)
+    return created_apartments
+
+# Endpoint to add multiple residents with optional image upload
+@app.post("/residents/", response_model=ResidentResponse)
+async def create_resident_with_image(
+    name: str = Form(...),
+    apartment_id: int = Form(...),
+    image: UploadFile = File(None),  # Make image optional
+    db: Session = Depends(get_db)
+):
+    try:
+        url = None
+        if image:
+            # Generate a unique filename using uuid
+            file_extension = os.path.splitext(image.filename)[1]
+            unique_filename = f"{uuid.uuid4()}{file_extension}"
+            filepath = os.path.join("static", unique_filename)
+            
+            # Save the image to a static directory
+            with open(filepath, "wb") as file:
+                file.write(image.file.read())
+
+            # Generate URL based on the saved path
+            url = f"/static/{unique_filename}"
+
+        # Create the resident with the generated URL if image is provided
+        resident = Resident(name=name, apartment_id=apartment_id, url=url)
+        db.add(resident)
+        db.commit()
+        db.refresh(resident)
+
+        return resident
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# Endpoint to get all residents
+@app.get("/residents/", response_model=List[ResidentResponse])
+def read_residents(db: Session = Depends(get_db)):
+    residents = db.query(Resident).all()
+    return residents
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+--- End of {file_path} ---
+
